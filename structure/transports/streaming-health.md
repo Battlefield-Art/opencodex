@@ -111,8 +111,8 @@ reader without awaiting a potentially broken cancellation promise.
 
 `src/server/responses/passthrough-execution.ts` applies the guard after native
 response classification, outside the direct relay and lifetime wrappers. Native
-SSE, including the missing-Content-Type fallback, retains its original Response
-identity and existing watchdog/terminal ownership. Bounded JSON and error readers
+SSE, including the missing-Content-Type fallback, retains its Response identity and
+is guarded only by an explicit budget ([native SSE stall](timeouts.md#native-responses-sse-stall)). Bounded JSON and error readers
 are not wrapped again. Direct bodies and returned redirect bodies are guarded;
 bytes, response headers and status are preserved.
 
@@ -256,8 +256,8 @@ egress. HTTP/SSE fallback retains Bun fetch's own proxy rules, which do not cons
 The endpoint handles `response.create`, ignores `response.processed`, supports warmup
 `generate: false`, and feeds the same request pipeline as HTTP/SSE.
 
-Incoming Responses connections share a 128-socket admission limit. Only when a new upgrade
-finds that limit full, the handler reclaims the least recently used eligible idle connection.
+Incoming Responses connections share a 128-socket admission limit. Only when a new local upgrade
+finds that limit full, the handler reclaims the least recently used eligible idle connection; a [Remote Link upgrade](../remote-link.md#responses-websocket-over-the-link) may reclaim only an idle Remote Link socket.
 Message handling and turn completion refresh a monotonic use order; connection age alone
 does not choose the victim. Eligibility requires an open socket, no active turn, no pending
 client tool or approval result, no retained native steering/injection owner, and no buffered
@@ -364,7 +364,7 @@ Live sideband admission and its bounded upstream handshake follow the [runtime c
 
 ## Translated Chat inline-image budget
 
-`src/adapters/openai-chat-images.ts` reuses the shared image normalization ladder for translated Chat bodies above a 3.5 MiB base64-image budget. This is best effort, not a whole-request ceiling. Remote URLs are not fetched; unprocessable and terminal images remain attached, and retained bytes continue to count during demotion. Under-budget construction stays synchronous; delegating MiMo awaits conditional asynchronous construction. Native decoding is admitted through a process-wide four-operation gate, guarded by a 16-million-pixel ceiling confirmed from codec metadata, and request cancellation stops queued and subsequent normalization work. Native Chat passthrough and Anthropic-only 413 retry policy retain their existing behavior.
+`src/adapters/openai-chat-images.ts` reuses the shared image normalization ladder for translated Chat bodies above a 3.5 MiB base64-image budget. This is best effort, not a whole-request ceiling. Remote URLs are not fetched; unprocessable and terminal images remain attached, and retained bytes continue to count during demotion. Under-budget construction stays synchronous; delegating MiMo awaits conditional asynchronous construction. Native decoding is admitted through a process-wide four-operation gate, guarded by a 16-million-pixel ceiling confirmed from codec metadata, and request cancellation stops queued and subsequent normalization work. Native Chat passthrough and Anthropic-only 413 retry policy retain their existing behavior. A provider whose registry row declares `minImageEdge` (Venice: 64) then has every decodable inline image whose short edge is below it upscaled to that edge, keeping the aspect ratio unless the long edge would pass 4096, where it is capped (extreme strips are then stretched); this runs after budget normalization because the 320px terminal tier can floor a wide screenshot under the minimum, and an image that fails to decode keeps its original URL.
 
 The [explicit model-capability contract](../config.md#explicit-per-model-capability-declarations) preserves operator declarations through provider storage and catalog capture; it does not infer upstream capability or change this surface's routing behavior.
 

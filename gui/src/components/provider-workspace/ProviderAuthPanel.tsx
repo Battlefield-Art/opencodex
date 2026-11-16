@@ -35,6 +35,8 @@ import { kiroSkipReasonKey } from "../../kiro-device-login-helpers";
 import { isApiTargetCaptureCurrent, targetFetch, type ApiTargetCapture } from "../../api";
 import { useRenderTargetCapture } from "../../use-render-target-capture";
 import KiroDeviceLoginDialog from "../KiroDeviceLoginDialog";
+import OAuthTosWarningModal from "../OAuthTosWarningModal";
+import { oauthRiskAcknowledgementBody } from "../../oauth-tos-risk";
 import type {
   AccountLoadState,
   OAuthAccountRow,
@@ -224,6 +226,12 @@ export default function ProviderAuthPanel({
   const [importStatus, setImportStatus] = useState<"idle" | "invalid" | "failed" | "complete">("idle");
   const [importResult, setImportResult] = useState<CockpitImportResult | null>(null);
   const importFileRef = useRef<HTMLInputElement>(null);
+  // An imported Antigravity credential carries the same Google account-ban risk as a login, so
+  // the import goes through the same warning dialog. The acknowledgement is never armed ahead of
+  // a pick: every chosen file, whether through the button or the input reached directly, is held
+  // here and imported only from that file's own Continue. Nothing can carry an earlier acceptance
+  // over to a later selection, whatever the engine does with the picker's cancel and focus events.
+  const [importWarning, setImportWarning] = useState<{ file: File } | null>(null);
   const [manualCode, setManualCode] = useState("");
   const [manualCodeBusy, setManualCodeBusy] = useState(false);
   const [manualCodeMsg, setManualCodeMsg] = useState("");
@@ -370,8 +378,12 @@ export default function ProviderAuthPanel({
     }
   };
 
-  const importCockpitFile = async (file: File | undefined) => {
+  const importCockpitFile = async (file: File | undefined, acknowledged: boolean) => {
     if (!file || importBusy) return;
+    if (!acknowledged) {
+      setImportWarning({ file });
+      return;
+    }
     setImportBusy(true);
     setImportStatus("idle");
     setImportResult(null);
@@ -391,7 +403,7 @@ export default function ProviderAuthPanel({
       const response = await targetFetch(capture, `${apiBase}/api/oauth/accounts/import`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: "google-antigravity", format: "cockpit-tools", document }),
+        body: JSON.stringify({ provider: "google-antigravity", format: "cockpit-tools", document, ...oauthRiskAcknowledgementBody("google-antigravity", acknowledged) }),
       });
       if (!response.ok) {
         setImportStatus("failed");
@@ -486,13 +498,28 @@ export default function ProviderAuthPanel({
                     className="sr-only"
                     aria-describedby="cockpit-import-description cockpit-import-status"
                     disabled={importBusy}
-                    onChange={event => { void importCockpitFile(event.currentTarget.files?.[0]); }}
+                    onChange={event => { void importCockpitFile(event.currentTarget.files?.[0], false); }}
                   />
                 </div>
                 <button type="button" className="btn btn-ghost btn-sm" disabled={importBusy}
                   onClick={() => importFileRef.current?.click()}>
                   {importBusy ? t("pws.cockpitImporting") : t("pws.cockpitImportChooseFile")}
                 </button>
+                {importWarning && (
+                  <OAuthTosWarningModal
+                    providerId="google-antigravity"
+                    providerLabel="Google Antigravity"
+                    onCancel={() => {
+                      setImportWarning(null);
+                      if (importFileRef.current) importFileRef.current.value = "";
+                    }}
+                    onContinue={() => {
+                      const pending = importWarning;
+                      setImportWarning(null);
+                      void importCockpitFile(pending.file, true);
+                    }}
+                  />
+                )}
                 <div id="cockpit-import-status" role="status" aria-live="polite">
                   {importStatus === "invalid" && t("pws.cockpitImportInvalid")}
                   {importStatus === "failed" && t("pws.cockpitImportFailed")}
@@ -683,7 +710,8 @@ export default function ProviderAuthPanel({
                         />
                       )}
                       <ProviderAccountQuota quotaMode={account.quotaMode} quota={account.quota}
-                        quotaUnavailable={account.quotaUnavailable} quotaPending={account.quotaPending} quotaFailure={account.quotaFailure} />
+                        quotaUnavailable={account.quotaUnavailable} quotaPending={account.quotaPending} quotaFailure={account.quotaFailure}
+                        quotaReadAt={account.quotaReadAt} />
                     </div>
                   </li>
                   );
@@ -750,26 +778,46 @@ export default function ProviderAuthPanel({
           <>
             {keys.length > 0 && (
               <ul className="pwi-auth-list">
-                {keys.map(entry => (
-                  <li key={entry.id} className={`pwi-auth-acct${entry.active ? " pwi-auth-acct--active" : ""}`}>
-                    <div className={`pwi-auth-row${entry.active ? " pwi-auth-row--active" : ""}`}>
+                {keys.map(entry => {
+                  const switching = switchingAccountId === entry.id;
+                  const pausing = pausingAccountId === entry.id;
+                  return (
+                  <li key={entry.id} className={`pwi-auth-acct${entry.active && !entry.disabled ? " pwi-auth-acct--active" : ""}`}>
+                    <div className={`pwi-auth-row${entry.active && !entry.disabled ? " pwi-auth-row--active" : ""}`}>
                     <button type="button" className="pwi-auth-row-main"
                       onClick={() => void authHandlers.onSwitchApiKey(item.name, entry)}
-                      disabled={entry.active && !entry.disabled} aria-label={entry.disabled ? `${t("codexAuth.resume")} — ${entry.label ?? entry.masked}` : undefined}>
-                      <span className={`pwi-auth-dot ${entry.active ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
+                      aria-current={entry.active && !entry.disabled ? "true" : undefined}
+                      disabled={(entry.active && !entry.disabled) || busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)} aria-label={entry.disabled ? `${t("pws.resumeAndActivateKey")} — ${entry.label ?? entry.masked}` : undefined}>
+                      <span className={`pwi-auth-dot ${entry.active && !entry.disabled ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
                       <span className="pwi-auth-row-copy">
                         <span className="pwi-auth-row-label">{entry.label ?? entry.masked}</span>
                         {entry.label && <code className="pwi-auth-row-secondary">{entry.masked} · {t("prov.accountId")}: {entry.id}</code>}
+                        {entry.disabled && (
+                          <span className="pwi-auth-row-secondary faint">{t("pws.accountPausedHint")}</span>
+                        )}
                       </span>
                       {entry.disabled && <span className="badge badge-muted" title={entry.pauseDetails ? formatAccountPauseTooltip(t, locale, entry.pauseDetails) : undefined}>{t("codexAuth.paused")} · {t("codexAuth.resume")}</span>}
                       {entry.active && !entry.disabled && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
+                      {switching && <span className="badge badge-muted">{t("pws.accountSwitching")}</span>}
                     </button>
+                    {authHandlers.onPauseApiKey && (
+                      <button type="button" className="btn btn-ghost btn-sm"
+                        aria-label={`${t(entry.disabled ? "codexAuth.resume" : "codexAuth.pause")} — ${entry.label ?? entry.masked}`}
+                        title={entry.disabled ? t("pws.accountPausedHint") : undefined}
+                        aria-busy={pausing}
+                        disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
+                        onClick={() => void authHandlers.onPauseApiKey!(item.name, entry, !entry.disabled)}>
+                        {t(entry.disabled ? "codexAuth.resume" : "codexAuth.pause")}
+                      </button>
+                    )}
                     <button type="button" className="btn btn-ghost btn-sm"
+                      disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                       onClick={() => void authHandlers.onEditAlias(item.name, "api-key", entry.id, entry.label)}>
                       {t("prov.editAlias")}
                     </button>
                     <button type="button" className="btn btn-ghost btn-sm pwi-auth-row-remove"
                       aria-label={`${t("common.remove")} — ${entry.label ?? entry.masked}`}
+                      disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                       title={`${t("common.remove")} — ${entry.label ?? entry.masked}`}
                       onClick={() => void authHandlers.onRemoveApiKey(item.name, entry)}>
                       <IconTrash style={{ width: 13, height: 13 }} aria-hidden="true" />
@@ -777,10 +825,11 @@ export default function ProviderAuthPanel({
                     </div>
                     <div className="pwi-auth-acct-quota">
                       <ProviderAccountQuota quotaMode={entry.quotaMode} quota={entry.quota}
-                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} quotaFailure={entry.quotaFailure} />
+                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} quotaFailure={entry.quotaFailure}
+                        quotaReadAt={entry.quotaReadAt} />
                     </div>
                   </li>
-                ))}
+                );})}
               </ul>
             )}
             {addingKey ? (

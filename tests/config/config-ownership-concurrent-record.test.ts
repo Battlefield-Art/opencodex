@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   CONFIG_UNINSTALL_MANIFEST,
   ConfigOwnershipLockError,
   ConfigUninstallInProgressError,
+  type ConfigRemovalResult,
   recordOwnedConfigPath,
   removeOwnedConfigState,
   setUninstallStepHookForTests,
@@ -70,10 +71,101 @@ function observeOwnerPublication(dir: string, completedOwner: string | null, cac
 const manifest = (dir: string) =>
   JSON.parse(readFileSync(join(dir, CONFIG_UNINSTALL_MANIFEST), "utf8")) as { paths: string[]; uninstallStartedAt?: number };
 
+/**
+ * A fresh process that spends its publication wait on an invalid pair, then completes the pair
+ * while keeping the exact stat identity the spent wait recorded — what the race between a
+ * creation's last failed read and the spent-wait sampling produces (#8270 review). Returns the
+ * following registration's outcome; exit 4 means the identity could not be preserved.
+ */
+function registerAfterPairCompletesAtSpentIdentity(dir: string): string {
+  // Ownership metadata comes from a separate process: a process that creates it caches the
+  // valid pair and would answer later initialization without touching the files.
+  const seed = Bun.spawnSync([process.execPath, "-e",
+    "import { initializeConfigOwnership } from " + JSON.stringify(modulePath) + ";\n"
+    + "initializeConfigOwnership(" + JSON.stringify(dir) + ");"]);
+  expect(seed.exitCode, seed.stderr.toString()).toBe(0);
+  const script = [
+    "import { lstatSync, readFileSync, utimesSync, writeFileSync } from \"node:fs\";",
+    "import { join } from \"node:path\";",
+    "import { initializeConfigOwnership, registerOwnedConfigPath } from " + JSON.stringify(modulePath) + ";",
+    "const dir = " + JSON.stringify(dir) + ";",
+    "const ownerPath = join(dir, \".opencodex-owner.json\");",
+    "const owner = readFileSync(ownerPath, \"utf8\");",
+    // A same-length owner id swap: complete in stat terms, an invalid pair semantically.
+    "const invalid = owner.replace(/\"ownerId\": \"[^\"]+\"/, '\"ownerId\": \"00000000-0000-4000-8000-000000000000\"');",
+    "writeFileSync(ownerPath, invalid);",
+    // A round-millisecond mtime the completing rewrite can restore exactly.
+    "const stamp = new Date(1_700_000_000_000);",
+    "utimesSync(ownerPath, stamp, stamp);",
+    "const spent = lstatSync(ownerPath, { bigint: true });",
+    "if (initializeConfigOwnership(dir)) throw new Error(\"invalid pair unexpectedly owned\");",
+    "writeFileSync(ownerPath, owner);",
+    "utimesSync(ownerPath, stamp, stamp);",
+    "const now = lstatSync(ownerPath, { bigint: true });",
+    "if (spent.dev !== now.dev || spent.ino !== now.ino || spent.size !== now.size || spent.mtimeNs !== now.mtimeNs) {",
+    "  console.log(\"identity-not-preserved\"); process.exit(4);",
+    "}",
+    "console.log(JSON.stringify(registerOwnedConfigPath(dir, join(dir, \"after-completion\"))));",
+  ].join("\n");
+  const child = Bun.spawnSync([process.execPath, "-e", script]);
+  expect(child.exitCode, child.stderr.toString()).toBe(0);
+  return JSON.parse(child.stdout.toString()) as string;
+}
+
+/**
+ * A fresh process whose metadata pair changes mid-wait. Returns each registration's outcome and
+ * how long its ownership initialization took: a pair that changed while a wait ran has not spent
+ * its own wait yet, so the next registration must pay it once (#8270 review).
+ */
+function registerAfterPairChangedMidWait(dir: string): { first: boolean; second: boolean; third: boolean; firstMs: number; secondMs: number; thirdMs: number } {
+  const seed = Bun.spawnSync([process.execPath, "-e",
+    "import { initializeConfigOwnership } from " + JSON.stringify(modulePath) + ";\n"
+    + "initializeConfigOwnership(" + JSON.stringify(dir) + ");"]);
+  expect(seed.exitCode, seed.stderr.toString()).toBe(0);
+  const script = [
+    "import { readFileSync, unlinkSync, writeFileSync } from \"node:fs\";",
+    "import { join } from \"node:path\";",
+    "import { initializeConfigOwnership } from " + JSON.stringify(modulePath) + ";",
+    "const dir = " + JSON.stringify(dir) + ";",
+    "const ownerPath = join(dir, \".opencodex-owner.json\");",
+    "const owner = readFileSync(ownerPath, \"utf8\");",
+    "const invalid = owner.replace(/\"ownerId\": \"[^\"]+\"/, '\"ownerId\": \"00000000-0000-4000-8000-000000000000\"');",
+    "unlinkSync(ownerPath);",
+    // Completing the owner bytes on the third clock read lands the change inside the wait.
+    "const realNow = Date.now; let reads = 0;",
+    "Date.now = () => { reads++; if (reads === 3) writeFileSync(ownerPath, invalid); return realNow(); };",
+    "let at = performance.now(); const first = initializeConfigOwnership(dir); const firstMs = performance.now() - at;",
+    "Date.now = realNow;",
+    "at = performance.now(); const second = initializeConfigOwnership(dir); const secondMs = performance.now() - at;",
+    "at = performance.now(); const third = initializeConfigOwnership(dir); const thirdMs = performance.now() - at;",
+    "console.log(JSON.stringify({ first, second, third, firstMs, secondMs, thirdMs }));",
+  ].join("\n");
+  const child = Bun.spawnSync([process.execPath, "-e", script]);
+  expect(child.exitCode, child.stderr.toString()).toBe(0);
+  return JSON.parse(child.stdout.toString());
+}
+
 function holdLock(dir: string): () => void {
   const database = new Database(join(dir, CONFIG_OWNERSHIP_LOCK), { create: false, readwrite: true });
   database.exec("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE");
   return () => { database.exec("ROLLBACK"); database.close(); };
+}
+
+/**
+ * Uninstall as a user would: a run refused because another process held the ownership lock wrote
+ * nothing and asks for a retry, so it is rerun. `onBusy` runs after each busy refusal.
+ */
+function uninstallRetryingBusyLock(dir: string, onBusy: () => void): ConfigRemovalResult {
+  const deadline = Date.now() + BARRIER_MS;
+  for (;;) {
+    const result = removeOwnedConfigState(dir);
+    const busy = result.status === "refused" && /^could not lock the ownership manifest: .*busy/.test(result.reason ?? "");
+    if (!busy || Date.now() >= deadline) return result;
+    // The refused run left no tombstone, so a racing registration may still succeed and be removed by the rerun.
+    expect(manifest(dir).uninstallStartedAt).toBeUndefined();
+    onBusy();
+    Bun.sleepSync(5);
+  }
 }
 
 /** Uninstall in another process, so this process keeps its warm ownership cache. */
@@ -111,7 +203,12 @@ describe("serialized ownership manifest (#8093)", () => {
     expect(manifest(dir).paths).not.toContain(CONFIG_OWNERSHIP_LOCK);
   }));
 
-  test("a registration racing uninstall is either removed or refused, never left unreported", withHome(async dir => {
+  // The children keep contending for the lock after the barrier releases it, so an uninstall can lose
+  // that contention and be refused as busy (macOS CI, dev run 43832690786). The second case forces it.
+  test.each([
+    ["the barrier lock released", false],
+    ["its first run finding the lock still held", true],
+  ] as const)("a registration racing uninstall is either removed or refused, never left unreported, with %s", (_label, busyFirst) => withHome(async dir => {
     expect(recordOwnedConfigPath(dir, join(dir, "seed"))).toBe(true);
     const names = Array.from({ length: 6 }, (_, i) => "racing-" + i);
     const signals = dirname(dir);
@@ -123,11 +220,16 @@ describe("serialized ownership manifest (#8093)", () => {
     expect(gates.every(gate => existsSync(gate.ready))).toBe(true);
     // Open the gate while holding the lock, so the children contend with uninstall for it.
     const release = holdLock(dir);
+    let held = true;
+    let busyRuns = 0;
+    const releaseOnce = () => { if (held) { held = false; release(); } };
+    let result: ConfigRemovalResult;
     try {
       writeFileSync(gates[0]!.go, "");
       await Bun.sleep(50);
-    } finally { release(); }
-    const result = removeOwnedConfigState(dir);
+      if (!busyFirst) releaseOnce();
+      result = uninstallRetryingBusyLock(dir, () => { busyRuns += 1; releaseOnce(); });
+    } finally { releaseOnce(); }
     const codes = await Promise.all(children.map(child => child.exited));
     expect(codes.every(code => code === 0 || code === 2 || code === 3)).toBe(true);
     names.forEach((name, i) => {
@@ -135,8 +237,10 @@ describe("serialized ownership manifest (#8093)", () => {
       if (codes[i] === 0) expect(existsSync(path)).toBe(false);
       else expect(result.residualPaths).toContain(path);
     });
+    expect(result.status).not.toBe("refused");
+    if (busyFirst) expect(busyRuns).toBeGreaterThan(0);
     expect(existsSync(join(dir, CONFIG_OWNERSHIP_LOCK))).toBe(false);
-  }), 60_000);
+  })(), 60_000);
 
   test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("an interrupted uninstall refuses registrations, cached paths included, and a rerun finishes it",
     withHome(async dir => {
@@ -413,7 +517,7 @@ describe("rerunning ocx uninstall through its cleanup flow (#8093)", () => {
     expect(() => recordOwnedConfigPath(dir, join(dir, "config-mutation.sqlite"))).toThrow(ConfigUninstallInProgressError);
     const lockPath = join(dirname(dir), "runtime", "lifecycle.sqlite");
     const result = await removeOwnedConfigAfterDesktopCleanup(
-      { serviceStop: "stopped", serviceRemoval: "removed", proxyProvenDown: true, respawnWindowVerified: false },
+      { serviceStop: "stopped", serviceRemoval: "removed", proxyProvenDown: true, respawnWindowVerified: true },
       {
         readConnection: () => ({ kind: "disconnected" }),
         inspectDesktop: () => ({ kind: "absent" }),
@@ -494,7 +598,7 @@ describe("rerun after the owner marker was already deleted (#8093)", () => {
     expect(() => recordOwnedConfigPath(dir, join(dir, "late"))).toThrow(ConfigUninstallInProgressError);
     const lockPath = join(dirname(dir), "runtime", "lifecycle.sqlite");
     const result = await removeOwnedConfigAfterDesktopCleanup(
-      { serviceStop: "stopped", serviceRemoval: "removed", proxyProvenDown: true, respawnWindowVerified: false },
+      { serviceStop: "stopped", serviceRemoval: "removed", proxyProvenDown: true, respawnWindowVerified: true },
       {
         readConnection: () => ({ kind: "disconnected" }),
         inspectDesktop: () => ({ kind: "absent" }),
@@ -894,5 +998,22 @@ describe("ownership edge cases from review (#8093)", () => {
       expect(sleeps - firstSleeps).toBe(0);
     } finally { Bun.sleepSync = realSleep; }
     expect(waitedMs).toBeGreaterThanOrEqual(90);
+  }));
+
+  // #8270 review: a pair completing between the wait's last failed read and the spent-wait
+  // sampling must not stay unowned on the identity match; the record suppresses only the wait.
+  test("a spent wait recorded on a completed pair still reloads and records", withHome(dir => {
+    expect(registerAfterPairCompletesAtSpentIdentity(dir)).toBe("recorded");
+    expect(manifest(dir).paths).toContain("after-completion");
+  }));
+
+  test("a pair changed during the publication wait spends its own wait", withHome(dir => {
+    const result = registerAfterPairChangedMidWait(dir);
+    expect([result.first, result.second, result.third]).toEqual([false, false, false]);
+    expect(result.firstMs).toBeGreaterThanOrEqual(90);
+    // The identity sampled before the wait no longer matches: the new pair waits once, then the
+    // honestly spent record suppresses further waits.
+    expect(result.secondMs).toBeGreaterThanOrEqual(90);
+    expect(result.thirdMs).toBeLessThan(result.secondMs);
   }));
 });

@@ -420,7 +420,7 @@ export default function Providers({ apiBase, targetKey, targetLabel }: { apiBase
   const {
     accountSets, setAccountSets, accountLoadStates, switchingAccounts, pausingAccounts, keyPools, fetchAccountSets, fetchKeyPools, beginAccountLogout,
     refreshAccountRosters, oauthCardProviders, keyCardProviders,
-    switchAccount, pauseAccount, setAccountPoolThreshold, setAccountThreshold, switchApiKey, removeApiKey, addApiKeyValue, editCredentialAlias,
+    switchAccount, pauseAccount, setAccountPoolThreshold, setAccountThreshold, switchApiKey, pauseApiKey, removeApiKey, addApiKeyValue, editCredentialAlias,
     removeAccount, activeAccountNeedsReauth,
   } = pools;
   const refreshSelection = useCallback((target?: AccountSelectionTarget) => {
@@ -508,7 +508,7 @@ export default function Providers({ apiBase, targetKey, targetLabel }: { apiBase
 
   const bumpModelsRefresh = () => setModelsRefreshToken(n => n + 1);
 
-  const { cancelLoginOAuth, loginOAuth, logoutOAuth, onNativeLoginSettled, loginCapture } = useProvidersOAuth({
+  const { cancelLoginOAuth, loginOAuth, logoutOAuth, onNativeLoginSettled, loginCapture, loginEndedCapture } = useProvidersOAuth({
     apiBase, targetKey: draftTargetKey, t, aliveRef, accountSets, setAccountSets,
     setBusy, setStatus, setLoginInfo, setOauthStatus, invalidateOauthStatusReads, captureOauthStatusRead, beginAccountLogout, notify,
     fetchConfig, fetchOauth, fetchAccountSets, fetchProviderQuotas, bumpModelsRefresh,
@@ -630,6 +630,7 @@ export default function Providers({ apiBase, targetKey, targetLabel }: { apiBase
     onRetryAccounts: async provider => { await fetchAccountSets([provider]); },
     onAddApiKey: addApiKeyValue,
     onSwitchApiKey: switchApiKey,
+    onPauseApiKey: pauseApiKey,
     onRemoveApiKey: removeApiKey,
     onEditAlias: editCredentialAlias,
     onRefreshQuota: refreshProviderQuota,
@@ -715,6 +716,7 @@ export default function Providers({ apiBase, targetKey, targetLabel }: { apiBase
             accountsFocusProvider={accountsFocus.provider}
             settingsFocusToken={settingsFocus.token}
             settingsFocusProvider={settingsFocus.provider}
+            settingsFocusField={settingsFocus.field}
             switchingAccountId={switchingAccounts[item.name]?.accountId ?? null}
             pausingAccountId={pausingAccounts[item.name]?.accountId ?? null}
             busyProvider={busy}
@@ -764,6 +766,7 @@ export default function Providers({ apiBase, targetKey, targetLabel }: { apiBase
         addModalAccountRows={addModalAccountRows}
         accountLoginStatus={accountLoginStatus}
         accountLoginHint={loginInfo}
+        accountLoginCaptures={{ active: loginCapture, ended: loginEndedCapture }}
         removeConfirmName={removeConfirmName}
         removeDefaultProvider={removeConfirmName === config.defaultProvider
           ? Object.entries(config.providers).find(([name, provider]) => name !== removeConfirmName && provider.disabled !== true)?.[0] ?? null
@@ -816,7 +819,7 @@ export default function Providers({ apiBase, targetKey, targetLabel }: { apiBase
           const pending = oauthTosPending;
           if (!pending) return;
           setOauthTosPending(null);
-          void loginOAuth(pending.provider, pending.addAccount, pending.accountId);
+          void loginOAuth(pending.provider, pending.addAccount, pending.accountId, true);
         }}
       />
     </>
